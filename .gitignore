@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+server/.env
+backups/
+*.log
+.mysql-integration-tmp/
+.serena/
+server/mysql-recovery-status.json
+order.md
+design_docs.md
+DESIGN_SYSTEM.md

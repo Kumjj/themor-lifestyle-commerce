@@ -1,0 +1,91 @@
+import assert from 'node:assert/strict';
+import mysql from 'mysql2/promise';
+import { randomBytes } from 'node:crypto';
+import { dbConfig as mainConfig } from '../config.mjs';
+
+// All test writes go to a newly-created, isolated database. The user's schema is never reset.
+const testDatabase = `themor_test_${randomBytes(6).toString('hex')}`;
+if (!/^themor_test_[a-f0-9]{12}$/.test(testDatabase)) throw new Error('Invalid test database');
+const admin = await mysql.createConnection({ ...mainConfig, database: undefined });
+let server;
+let pool;
+let app;
+let createdDatabase = false;
+try {
+  await admin.query(`CREATE DATABASE \`${testDatabase}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+  createdDatabase = true;
+  process.env.DB_NAME = testDatabase;
+  // config.mjs is cached, so redirect its exported shared configuration before opening the pool.
+  mainConfig.database = testDatabase;
+  const db = await import('../database.mjs');
+  pool = db.pool;
+  await db.initializeDatabase();
+  const { seedDatabase } = await import('../seed.mjs');
+  await seedDatabase();
+  const { createApp } = await import('../app.mjs');
+  app = createApp();
+  server = app.listen(0, '127.0.0.1');
+  await new Promise(resolve => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${server.address().port}/api`;
+  async function request(path, { method = 'GET', body, cookie = '' } = {}) {
+    const response = await fetch(`${base}${path}`, { method, headers: { 'Content-Type': 'application/json', 'X-Themor-Client': 'web', Cookie: cookie }, ...(body ? { body: JSON.stringify(body) } : {}) });
+    const data = await response.json();
+    return { status: response.status, data, cookie: response.headers.get('set-cookie')?.split(';')[0] || cookie };
+  }
+  assert.equal((await request('/health')).data.storage, 'mysql');
+  assert.equal((await request('/auth/login', { method: 'POST', body: { account: 'kjj', password: 'incorrect' } })).status, 401);
+  const seller = await request('/auth/register', { method: 'POST', body: { email: 'seller@test.local', password: 'test-password-1', name: '검증 판매자', role: 'admin' } });
+  assert.equal(seller.status, 200);
+  assert.equal(seller.data.role, 'user');
+  const registration = await request('/products', { method: 'POST', cookie: seller.cookie, body: { name: 'SQL 연동 검증 상품', category: 'living', price: 12000, stock: 2, sellerId: 'admin-kjj' } });
+  assert.equal(registration.status, 201);
+  const product = registration.data;
+  assert.equal(product.sellerId, seller.data.id);
+  assert.equal(product.reviewCount, 0);
+  assert.equal(product.rating, null);
+  const [[stored]] = await pool.execute('SELECT name, price, stock FROM products WHERE id = ?', [product.id]);
+  assert.equal(stored.name, product.name);
+  assert.equal(Number(stored.price), 12000);
+  assert.equal((await request('/requests', { method: 'POST', cookie: seller.cookie, body: { type: 'report', targetProductId: product.id, title: '본인 신고', details: '접수되면 안 됩니다.' } })).status, 403);
+  const buyer = await request('/auth/register', { method: 'POST', body: { email: 'buyer@test.local', password: 'test-password-2', name: '검증 구매자' } });
+  assert.equal((await request(`/products/${product.id}`, { method: 'PATCH', cookie: buyer.cookie, body: { price: 1 } })).status, 403);
+  assert.equal((await request(`/products/${product.id}`, { method: 'DELETE', cookie: buyer.cookie })).status, 403);
+  assert.equal((await request('/orders', { method: 'POST', cookie: buyer.cookie, body: { items: [{ id: product.id, quantity: 3 }], shippingAddress: '검증 주소', recipient: '검증 수령인' } })).status, 409);
+  const order = await request('/orders', { method: 'POST', cookie: buyer.cookie, body: { items: [{ id: product.id, quantity: 1, price: 1 }], totalAmount: 1, shippingAddress: '검증 주소', recipient: '검증 수령인' } });
+  assert.equal(order.status, 201);
+  assert.equal(order.data.totalAmount, 12000);
+  const [[stock]] = await pool.execute('SELECT stock FROM products WHERE id = ?', [product.id]);
+  assert.equal(stock.stock, 1);
+  const [[orderItem]] = await pool.execute('SELECT oi.quantity, oi.unit_price FROM orders o JOIN order_items oi ON oi.order_id = o.id WHERE o.id = ?', [order.data.orderId]);
+  assert.equal(orderItem.quantity, 1);
+  assert.equal(Number(orderItem.unit_price), 12000);
+  assert.equal((await request('/orders', { cookie: seller.cookie })).data.length, 0);
+  assert.equal((await request('/orders')).data.length, 0);
+  const concurrent = await Promise.all([1, 2].map(() => request('/orders', { method: 'POST', cookie: buyer.cookie, body: { items: [{ id: product.id, quantity: 1 }], shippingAddress: '검증 주소', recipient: '검증 수령인' } })));
+  assert.deepEqual(concurrent.map(result => result.status).sort(), [201, 409]);
+  const [[afterConcurrent]] = await pool.execute('SELECT stock FROM products WHERE id = ?', [product.id]);
+  assert.equal(afterConcurrent.stock, 0);
+  const report = await request('/requests', { method: 'POST', cookie: buyer.cookie, body: { type: 'report', targetProductId: product.id, title: '검증 신고', details: '권한 검사 확인' } });
+  assert.equal(report.status, 201);
+  assert.equal((await request('/admin/reports/1', { cookie: buyer.cookie })).status, 403);
+  const adminLogin = await request('/auth/login', { method: 'POST', body: { account: 'kjj', password: '1234' } });
+  for (let number = 1; number <= 5; number++) assert.equal((await request(`/admin/reports/${number}`, { cookie: adminLogin.cookie })).status, 200);
+  assert.equal((await request(`/products/${product.id}`, { method: 'DELETE', cookie: seller.cookie })).status, 200);
+  assert(!(await request('/products')).data.some(item => item.id === product.id));
+  const [[history]] = await pool.execute('SELECT COUNT(*) AS count FROM order_items WHERE product_id = ?', [product.id]);
+  assert.equal(Number(history.count), 2);
+  await seedDatabase();
+  assert(!(await request('/products')).data.some(item => item.id === product.id));
+  const legacyProduct = { id: 'legacy-test-product', name: '이전 브라우저 상품', category: 'living', price: 5000, stock: 3, sellerId: seller.data.id, seller: seller.data.name };
+  const firstImport = await request('/admin/import-legacy', { method: 'POST', cookie: adminLogin.cookie, body: { products: [legacyProduct] } });
+  assert.equal(firstImport.data.total, 1);
+  const secondImport = await request('/admin/import-legacy', { method: 'POST', cookie: adminLogin.cookie, body: { products: [legacyProduct] } });
+  assert.equal(secondImport.data.total, 0);
+  console.log('PASS: real MySQL schema/seed, login, ownership, registration → SQL, orders → stock + JOIN, reporting, deletion history, idempotent legacy import');
+} finally {
+  app?.locals.dispose();
+  if (server) await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
+  if (pool) await pool.end();
+  if (createdDatabase) await admin.query(`DROP DATABASE IF EXISTS \`${testDatabase}\``);
+  await admin.end();
+}
