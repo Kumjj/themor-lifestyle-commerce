@@ -20,6 +20,12 @@ React 18, Vite, Tailwind CSS 기반의 세련된 프론트엔드와 Node.js Expr
 
 새로운 PC나 환경으로 프로젝트를 옮겼을 때, 아래 방법으로 손쉽게 환경을 구축할 수 있습니다.
 
+```bash
+# 저장소 복제 (새 컴퓨터에서)
+git clone https://github.com/Kumjj/themor-lifestyle-commerce.git
+cd themor-lifestyle-commerce
+```
+
 ### 방법 1. 윈도우 환경 (더블클릭 실행)
 1. **`setup.bat` 더블클릭**:
    - `npm install` 패키지 자동 설치
